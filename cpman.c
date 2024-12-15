@@ -241,20 +241,54 @@ void signal_handler(int sig) {
 }
 
 void check_command() {
-    if (access("/usr/bin/docker", X_OK) == 0 &&
-        system("/usr/bin/docker compose version > /dev/null 2>&1") == 0) {
-        strcpy(COMPOSE_CMD, "/usr/bin/docker compose");
-        strcpy(DOCKER_CMD, "/usr/bin/docker");
-        printf(GREEN "Using docker compose\n" NC);
-    } else if (access("/usr/local/bin/podman-compose", X_OK) == 0 &&
-               access("/usr/bin/podman", X_OK) == 0) {
-        strcpy(COMPOSE_CMD, "/usr/local/bin/podman-compose");
-        strcpy(DOCKER_CMD, "/usr/bin/podman");
-        printf(GREEN "Using podman-compose\n" NC);
-    } else {
-        printf(RED "No compatible compose command found.\n" NC);
-        exit(1);
+    FILE *fp;
+    char docker_path[256] = {0};
+    char compose_path[256] = {0};
+
+    // 动态查找 docker 的路径
+    fp = popen("which docker", "r");
+    if (fp != NULL && fgets(docker_path, sizeof(docker_path), fp) != NULL) {
+        docker_path[strcspn(docker_path, "\n")] = 0;
+        pclose(fp);
+
+        if (access(docker_path, X_OK) == 0)
+        {
+               // 检查 docker compose 是否存在
+            char command[512];
+            snprintf(command, sizeof(command), "%s compose version > /dev/null 2>&1",docker_path);
+           if (system(command) == 0) {
+                strcpy(COMPOSE_CMD,  "docker compose");
+                strcpy(DOCKER_CMD, docker_path);
+                 printf(GREEN "Using docker compose\n" NC);
+               return ;
+            }
+          }
+     }
+
+    // 动态查找 podman-compose 的路径
+    fp = popen("which podman-compose", "r");
+    if (fp != NULL && fgets(compose_path, sizeof(compose_path), fp) != NULL) {
+         compose_path[strcspn(compose_path, "\n")] = 0;
+            pclose(fp);
+             if (access(compose_path, X_OK) == 0) {
+                    fp = popen("which podman", "r");
+                    char podman_path[256];
+                    if (fp != NULL && fgets(podman_path, sizeof(podman_path),fp) != NULL){
+                         podman_path[strcspn(podman_path, "\n")] = 0;
+                        pclose(fp);
+                        if (access(podman_path, X_OK) == 0) {
+                            strcpy(COMPOSE_CMD, compose_path);
+                            strcpy(DOCKER_CMD, podman_path);
+                            printf(GREEN "Using podman-compose\n" NC);
+                            return;
+                        }
+                    }
+              if(fp)  pclose(fp);
+            }
     }
+    if(fp) pclose(fp);
+    printf(RED "No compatible compose command found.\n" NC);
+    exit(1);
 }
 
 void find_compose_files() {
