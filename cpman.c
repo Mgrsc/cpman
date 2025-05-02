@@ -10,6 +10,7 @@
 #include <time.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <libgen.h>
 #include "cpman.h"
 
 char COMPOSE_CMD[256] = {0};
@@ -18,8 +19,8 @@ char **compose_files = NULL;
 int compose_file_count = 0;
 char *exclude_pattern = NULL;
 int verbose_mode = 0;
-int timeout_seconds = 60; // 默认超时时间为60秒
-int max_depth = 2;        // 默认最大检测深度为2层
+int timeout_seconds = 60;
+int max_depth = 2;
 
 int main(int argc, char *argv[]) {
     signal(SIGINT, signal_handler);
@@ -46,12 +47,12 @@ int main(int argc, char *argv[]) {
 
     check_command();
     find_compose_files();
-    
+
     if (compose_file_count == 0) {
         printf(YELLOW "No compose files found. Did you specify the correct path? Try adjusting the depth with -d option.\n" NC);
         return 1;
     }
-    
+
     main_menu(mode);
 
     free_compose_files();
@@ -88,15 +89,33 @@ void main_menu(int mode) {
     }
 }
 
-int execute_command_with_timeout(const char *command, char *output, size_t output_size) {
+int execute_command_with_timeout(const char *command, char *output, size_t output_size, const char *work_dir) {
     if (verbose_mode) {
-        printf(CYAN "Executing: %s\n" NC, command);
+        if (work_dir) {
+            printf(CYAN "Executing in %s: %s\n" NC, work_dir, command);
+        } else {
+            printf(CYAN "Executing: %s\n" NC, command);
+        }
     }
-    
+
+    char original_dir[PATH_MAX];
+    if (work_dir) {
+        if (!getcwd(original_dir, sizeof(original_dir))) {
+            perror("Failed to get current directory");
+            return -1;
+        }
+
+        if (chdir(work_dir) != 0) {
+            perror("Failed to change to working directory");
+            return -1;
+        }
+    }
+
     char temp_file[] = "/tmp/cpman_output_XXXXXX";
     int fd = mkstemp(temp_file);
     if (fd == -1) {
         perror("Failed to create temporary file");
+        if (work_dir) chdir(original_dir);
         return -1;
     }
 
@@ -109,16 +128,15 @@ int execute_command_with_timeout(const char *command, char *output, size_t outpu
     if (pid == -1) {
         perror("Failed to fork");
         unlink(temp_file);
+        if (work_dir) chdir(original_dir);
         return -1;
     }
 
     if (pid == 0) {
-        // Child process
         execl("/bin/sh", "sh", "-c", redirect_cmd, NULL);
-        exit(1); // In case execl fails
+        exit(1);
     }
 
-    // Parent process
     time_t start_time = time(NULL);
     int status;
     pid_t result;
@@ -127,19 +145,19 @@ int execute_command_with_timeout(const char *command, char *output, size_t outpu
     while (1) {
         result = waitpid(pid, &status, WNOHANG);
         if (result == pid) {
-            // Command completed
             break;
         } else if (result == -1) {
             perror("waitpid failed");
             kill(pid, SIGKILL);
             unlink(temp_file);
+            if (work_dir) chdir(original_dir);
             return -1;
         }
 
         if (time(NULL) - start_time > timeout_seconds) {
             printf(RED "\nCommand timed out after %d seconds. Show output? [y/N]: " NC, timeout_seconds);
             fflush(stdout);
-            
+
             char response[10];
             fgets(response, sizeof(response), stdin);
             if (response[0] == 'y' || response[0] == 'Y') {
@@ -154,30 +172,26 @@ int execute_command_with_timeout(const char *command, char *output, size_t outpu
                     fclose(fp);
                 }
             }
-            
+
             printf(YELLOW "Terminate the process? [Y/n]: " NC);
             fgets(response, sizeof(response), stdin);
             if (response[0] != 'n' && response[0] != 'N') {
                 kill(pid, SIGTERM);
-                sleep(1); // Give it a chance to terminate gracefully
-                kill(pid, SIGKILL); // Force kill if still running
+                sleep(1);
+                kill(pid, SIGKILL);
                 timed_out = 1;
                 break;
             } else {
                 printf(YELLOW "Continuing to wait for the process to complete...\n" NC);
-                // Reset the timer
                 start_time = time(NULL);
             }
         }
-        
-        // Short sleep to avoid CPU hogging
-        usleep(100000); // 100ms
+
+        usleep(100000);
     }
 
-    // 读取和处理输出
     FILE *fp = fopen(temp_file, "r");
     if (fp) {
-        // 如果是verbose模式，始终显示命令输出
         if (verbose_mode) {
             char buffer[256];
             printf(YELLOW "\n--- Command Output ---\n" NC);
@@ -185,17 +199,15 @@ int execute_command_with_timeout(const char *command, char *output, size_t outpu
                 printf("%s", buffer);
             }
             printf(YELLOW "\n--- End Output ---\n" NC);
-            
-            // 重置文件指针以便再次读取
+
             rewind(fp);
         }
-        
-        // 如果需要返回输出内容
+
         if (output && output_size > 0) {
             size_t bytes_read = fread(output, 1, output_size - 1, fp);
-            output[bytes_read] = '\0';  // Ensure null-termination
+            output[bytes_read] = '\0';
         }
-        
+
         fclose(fp);
     } else if (output && output_size > 0) {
         output[0] = '\0';
@@ -203,24 +215,61 @@ int execute_command_with_timeout(const char *command, char *output, size_t outpu
 
     unlink(temp_file);
 
+    if (work_dir) {
+        if (chdir(original_dir) != 0) {
+            perror("Failed to return to original directory");
+        }
+    }
+
     if (timed_out) {
-        return -2;  // Special code for timeout
+        return -2;
     }
 
     int exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
     if (verbose_mode) {
         printf(CYAN "Command exited with code: %d\n" NC, exit_code);
     }
-    
+
     return exit_code;
 }
 
 char *get_image_id(const char *file) {
+    char *file_copy = strdup(file);
+    if (!file_copy) {
+        perror("Failed to allocate memory");
+        return NULL;
+    }
+
+    char *dir = dirname(strdup(file_copy));
+    char *base_filename = basename(file_copy);
+
     char command[1024];
-    snprintf(command, sizeof(command), "%s -f \"%s\" config | grep 'image:' | awk '{print $2}'", COMPOSE_CMD, file);
+    char original_dir[PATH_MAX];
+
+    if (!getcwd(original_dir, sizeof(original_dir))) {
+        perror("Failed to get current directory");
+        free(file_copy);
+        free(dir);
+        return NULL;
+    }
+
+    if (chdir(dir) != 0) {
+        perror("Failed to change to compose file directory");
+        free(file_copy);
+        free(dir);
+        return NULL;
+    }
+
+    snprintf(command, sizeof(command), "%s -f \"%s\" config | grep 'image:' | awk '{print $2}'",
+             COMPOSE_CMD, base_filename);
 
     FILE *fp = popen(command, "r");
-    if (!fp) return NULL;
+    if (!fp) {
+        chdir(original_dir);
+        free(file_copy);
+        free(dir);
+        return NULL;
+    }
 
     char images[4096] = {0};
     char line[256];
@@ -229,11 +278,19 @@ char *get_image_id(const char *file) {
     }
     pclose(fp);
 
+    if (chdir(original_dir) != 0) {
+        perror("Failed to return to original directory");
+    }
+
+    free(file_copy);
+    free(dir);
+
     char digests[8192] = {0};
 
     char *image = strtok(images, "\n");
     while (image != NULL) {
-        snprintf(command, sizeof(command), "%s image inspect --format='{{index .RepoDigests 0}}' \"%s\" 2>/dev/null", DOCKER_CMD, image);
+        snprintf(command, sizeof(command), "%s image inspect --format='{{index .RepoDigests 0}}' \"%s\" 2>/dev/null",
+                DOCKER_CMD, image);
 
         fp = popen(command, "r");
         if (!fp) {
@@ -243,7 +300,7 @@ char *get_image_id(const char *file) {
 
         char digest[512] = {0};
         if (fgets(digest, sizeof(digest), fp) == NULL) {
-            strcpy(digest, image); // Use image name if no digest found
+            strcpy(digest, image);
         }
 
         strtok(digest, "\n");
@@ -290,12 +347,20 @@ void update_compose_files() {
         const char *compose_file = compose_files[i];
         printf(CYAN "Updating %s...\n" NC, compose_file);
 
+        char *file_copy = strdup(compose_file);
+        if (!file_copy) {
+            perror("Failed to allocate memory");
+            continue;
+        }
+        char *compose_dir = dirname(file_copy);
+
         char *image_id = get_image_id(compose_file);
         if (image_id) {
             strncpy(before_pull, image_id, 32);
             before_pull[32] = '\0';
         } else {
             printf(RED "Failed to get image digest before pull\n" NC);
+            free(file_copy);
             continue;
         }
 
@@ -303,23 +368,25 @@ void update_compose_files() {
         snprintf(pull_command, sizeof(pull_command), "%s -f \"%s\" pull", COMPOSE_CMD, compose_file);
 
         printf(YELLOW "Pulling images (timeout: %d seconds)...\n" NC, timeout_seconds);
-        int result = execute_command_with_timeout(pull_command, output_buffer, sizeof(output_buffer));
-        
+        int result = execute_command_with_timeout(pull_command, output_buffer, sizeof(output_buffer), compose_dir);
+
         if (result == -2) {
             printf(RED "Pull command timed out.\n" NC);
+            free(file_copy);
             continue;
         } else if (result != 0) {
             printf(RED "Pull command failed with exit code %d.\n" NC, result);
+            free(file_copy);
             continue;
         }
 
-        // 重新获取镜像信息以检测变化
         image_id = get_image_id(compose_file);
         if (image_id) {
             strncpy(after_pull, image_id, 32);
             after_pull[32] = '\0';
         } else {
             printf(RED "Failed to get image digest after pull\n" NC);
+            free(file_copy);
             continue;
         }
 
@@ -328,19 +395,21 @@ void update_compose_files() {
 
             char down_command[1024];
             snprintf(down_command, sizeof(down_command), "%s -f \"%s\" down", COMPOSE_CMD, compose_file);
-            
-            result = execute_command_with_timeout(down_command, output_buffer, sizeof(output_buffer));
+
+            result = execute_command_with_timeout(down_command, output_buffer, sizeof(output_buffer), compose_dir);
             if (result != 0 && result != -2) {
                 printf(RED "Down command failed with exit code %d.\n" NC, result);
+                free(file_copy);
                 continue;
             }
 
             char up_command[1024];
             snprintf(up_command, sizeof(up_command), "%s -f \"%s\" up -d", COMPOSE_CMD, compose_file);
-            
-            result = execute_command_with_timeout(up_command, output_buffer, sizeof(output_buffer));
+
+            result = execute_command_with_timeout(up_command, output_buffer, sizeof(output_buffer), compose_dir);
             if (result != 0 && result != -2) {
                 printf(RED "Up command failed with exit code %d.\n" NC, result);
+                free(file_copy);
                 continue;
             }
 
@@ -348,64 +417,82 @@ void update_compose_files() {
         } else {
             printf(YELLOW "No new images, skipping restart.\n" NC);
         }
+
+        free(file_copy);
     }
 }
 
 void pause_all_compose() {
     char output_buffer[4096];
-    
+
     for (int i = 0; i < compose_file_count; i++) {
         const char *compose_file = compose_files[i];
         printf(CYAN "Stopping services in %s...\n" NC, compose_file);
 
+        char *file_copy = strdup(compose_file);
+        if (!file_copy) {
+            perror("Failed to allocate memory");
+            continue;
+        }
+        char *compose_dir = dirname(file_copy);
+
         char down_command[1024];
         snprintf(down_command, sizeof(down_command), "%s -f \"%s\" down", COMPOSE_CMD, compose_file);
 
-        int result = execute_command_with_timeout(down_command, output_buffer, sizeof(output_buffer));
+        int result = execute_command_with_timeout(down_command, output_buffer, sizeof(output_buffer), compose_dir);
         if (result != 0 && result != -2) {
             printf(RED "Down command failed with exit code %d.\n" NC, result);
+            free(file_copy);
             continue;
         }
 
         printf(BLUE "Services stopped.\n" NC);
+        free(file_copy);
     }
 }
 
 void start_all_compose() {
     char output_buffer[4096];
-    
+
     for (int i = 0; i < compose_file_count; i++) {
         const char *compose_file = compose_files[i];
         printf(CYAN "Starting services in %s...\n" NC, compose_file);
 
+        char *file_copy = strdup(compose_file);
+        if (!file_copy) {
+            perror("Failed to allocate memory");
+            continue;
+        }
+        char *compose_dir = dirname(file_copy);
+
         char up_command[1024];
         snprintf(up_command, sizeof(up_command), "%s -f \"%s\" up -d", COMPOSE_CMD, compose_file);
 
-        int result = execute_command_with_timeout(up_command, output_buffer, sizeof(output_buffer));
+        int result = execute_command_with_timeout(up_command, output_buffer, sizeof(output_buffer), compose_dir);
         if (result != 0 && result != -2) {
             printf(RED "Up command failed with exit code %d.\n" NC, result);
+            free(file_copy);
             continue;
         }
 
         printf(GREEN "Services started.\n" NC);
+        free(file_copy);
     }
 }
 
-// 检查文件是否是有效的 compose 文件
 int is_valid_compose_file(const char *filepath) {
     FILE *fp = fopen(filepath, "r");
     if (!fp) return 0;
-    
+
     char buffer[4096];
     size_t bytes_read = fread(buffer, 1, sizeof(buffer) - 1, fp);
     buffer[bytes_read] = '\0';
     fclose(fp);
-    
-    // 简单验证：包含关键字 services 或 version
+
     if (strstr(buffer, "services:") || strstr(buffer, "version:")) {
         return 1;
     }
-    
+
     return 0;
 }
 
@@ -421,7 +508,6 @@ void check_command() {
     char docker_path[256] = {0};
     char compose_path[256] = {0};
 
-    // 动态查找 docker 的路径
     fp = popen("which docker", "r");
     if (fp != NULL && fgets(docker_path, sizeof(docker_path), fp) != NULL) {
         docker_path[strcspn(docker_path, "\n")] = 0;
@@ -429,7 +515,6 @@ void check_command() {
 
         if (access(docker_path, X_OK) == 0)
         {
-            // 检查 docker compose 是否存在
             char command[512];
             snprintf(command, sizeof(command), "%s compose version > /dev/null 2>&1", docker_path);
             if (system(command) == 0) {
@@ -441,7 +526,6 @@ void check_command() {
         }
     }
 
-    // 动态查找 podman-compose 的路径
     fp = popen("which podman-compose", "r");
     if (fp != NULL && fgets(compose_path, sizeof(compose_path), fp) != NULL) {
         compose_path[strcspn(compose_path, "\n")] = 0;
@@ -463,10 +547,9 @@ void check_command() {
         }
     }
     if (fp) pclose(fp);
-    
-    // 尝试其他可能的命令路径
+
     printf(YELLOW "Trying alternative commands...\n" NC);
-    
+
     if (system("command -v docker-compose > /dev/null 2>&1") == 0) {
         fp = popen("which docker", "r");
         if (fp != NULL && fgets(docker_path, sizeof(docker_path), fp) != NULL) {
@@ -481,7 +564,7 @@ void check_command() {
         }
         if (fp) pclose(fp);
     }
-    
+
     printf(RED "No compatible compose command found.\n" NC);
     exit(1);
 }
@@ -492,19 +575,19 @@ void find_compose_files() {
         fprintf(stderr, RED "Memory allocation failed\n" NC);
         exit(1);
     }
-    
+
     compose_file_count = 0;
     traverse_directories(".", 0);
 
     if (compose_file_count > 0) {
         printf(YELLOW "Found %d compose files", compose_file_count);
-        
+
         if (exclude_pattern && *exclude_pattern) {
             printf(" (excluding '%s')", exclude_pattern);
         } else {
             printf(" (ignored directories containing 'ignore')");
         }
-        
+
         printf(":\n" NC);
 
         for (int i = 0; i < compose_file_count; i++) {
@@ -558,13 +641,12 @@ void traverse_directories(const char *base_path, int depth) {
                 fprintf(stderr, YELLOW "Warning: Reached maximum compose file limit (1000)\n" NC);
                 break;
             }
-            
+
             if (strcmp(entry->d_name, "compose.yaml") == 0 ||
                 strcmp(entry->d_name, "compose.yml") == 0 ||
                 strcmp(entry->d_name, "docker-compose.yaml") == 0 ||
                 strcmp(entry->d_name, "docker-compose.yml") == 0) {
-                
-                // 验证是有效的 compose 文件
+
                 if (is_valid_compose_file(path)) {
                     compose_files[compose_file_count] = strdup(path);
                     if (!compose_files[compose_file_count]) {
@@ -584,7 +666,7 @@ void traverse_directories(const char *base_path, int depth) {
 
 void free_compose_files() {
     if (!compose_files) return;
-    
+
     for (int i = 0; i < compose_file_count; i++) {
         free(compose_files[i]);
     }
@@ -681,7 +763,7 @@ int parse_args(int argc, char *argv[], int *mode, char **path, char **exclude) {
                 print_help();
                 return 0;
             }
-	} else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
+        } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
             verbose_mode = 1;
         } else if (strcmp(argv[i], "--help") == 0) {
             print_help();
@@ -695,3 +777,4 @@ int parse_args(int argc, char *argv[], int *mode, char **path, char **exclude) {
 
     return 1;
 }
+

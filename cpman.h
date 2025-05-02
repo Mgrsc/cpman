@@ -10,7 +10,7 @@
 #define BLUE  "\033[0;34m"
 #define CYAN  "\033[0;36m"
 #define RED   "\033[0;31m"
-#define NC    "\033[0m" // No Color
+#define NC    "\033[0m"
 
 extern char COMPOSE_CMD[256];
 extern char DOCKER_CMD[256];
@@ -27,7 +27,7 @@ void pause_all_compose();
 void start_all_compose();
 
 char *get_image_id(const char *file);
-int execute_command_with_timeout(const char *command, char *output, size_t output_size);
+int execute_command_with_timeout(const char *command, char *output, size_t output_size, const char *work_dir);
 void signal_handler(int sig);
 void check_command();
 void find_compose_files();
